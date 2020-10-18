@@ -1,0 +1,64 @@
+%% $Id$
+
+{application, mongooseim,
+ [{description, "MongooseIM"},
+  {vsn, {cmd, "tools/generate_vsn.sh"}},
+  {modules, []},
+  {registered, [
+               ]},
+  {applications, [
+                  asn1,
+                  backoff,
+                  base16,
+                  cache_tab,
+                  cowboy,
+                  cpool,
+                  crypto,
+                  fast_scram,
+                  csv,
+                  eredis,
+                  eldap,
+                  erlang_pmp,
+                  exml,
+                  exometer_core,
+                  exometer_report_graphite,
+                  exometer_report_statsd,
+                  jiffy,
+                  jwerl,
+                  fusco,
+                  idna,
+                  kernel,
+                  lasse,
+                  mnesia,
+                  observer_cli,
+                  pa,
+                  public_key,
+                  ranch,
+                  recon,
+                  runtime_tools,
+                  sasl,
+                  ssl,
+                  stdlib,
+%%                  syslogger, % uncomment to enable a logger handler for syslog
+                  jid,
+                  fast_tls,
+                  tirerl,
+                  usec,
+                  uuid,
+                  xmerl,
+                  worker_pool,
+                  gen_fsm_compat,
+                  erl_csv_generator,
+                  trails,
+                  cowboy_swagger,
+                  tomerl,
+                  flatlog
+                 ]},
+  {env, []},
+  {mod, {ejabberd_app, []}}]}.
+
+
+%% Local Variables:
+%% mode: erlang
+%% End:
+%% vim: set filetype=erlang tabstop=8:

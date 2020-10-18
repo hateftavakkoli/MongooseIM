@@ -1,0 +1,407 @@
+#!/bin/bash
+
+RUNNER_SCRIPT_DIR={{{mongooseim_script_dir}}}
+RUNNER_BASE_DIR="${RUNNER_SCRIPT_DIR%/*}"
+## Depending on build time config RUNNER_ETC_DIR may depend on RUNNER_BASE_DIR.
+RUNNER_ETC_DIR="{{mongooseim_etc_dir}}"
+RUNNER_USER="{{mongooseim_runner_user}}"
+
+# Return variables with MIM_ prefix
+function preserved_variables
+{
+    EXP=$(export -p | grep '^declare -x MIM_')
+    # if not empty
+    if [ ! -z "$EXP" ]; then
+        # concat lines with " && " separator and add the separator at the end
+        echo "${EXP//$'\n'/ && } && "
+    fi
+}
+
+# Make sure this script is running as the appropriate user
+if [ ! -z "$RUNNER_USER" ] && [ `whoami` != "$RUNNER_USER" ]; then
+    # Preserve some env variables
+    exec runuser -s /bin/bash -l "$RUNNER_USER" -c "$(preserved_variables) $0 $*"
+fi
+
+MIM_DIR="${RUNNER_SCRIPT_DIR%/*}"
+EJABBERD_VMARGS_PATH="${RUNNER_ETC_DIR}"/vm.args
+START_ERL=`cat "$MIM_DIR"/releases/start_erl.data`
+ERTS_VSN="${START_ERL% *}"
+ERTS_PATH="$MIM_DIR/erts-$ERTS_VSN/bin"
+ERL="$ERTS_PATH"/erl
+EPMD="$ERTS_PATH"/epmd
+EJABBERD_EBIN_PATH="$MIM_DIR"/lib/mongooseim-*/ebin/
+SCRIPTS_DIR="$MIM_DIR"/scripts
+
+EJABBERD_STATUS_PATH="{{mongooseim_status_dir}}/status"
+export EJABBERD_STATUS_PATH="$EJABBERD_STATUS_PATH"
+
+COOKIE_ARG=`grep -e '^-setcookie' "$EJABBERD_VMARGS_PATH"`
+if [ -z "$COOKIE_ARG" ]; then
+    echo "vm.args needs to have a -setcookie parameter."
+    exit 1
+fi
+
+NODENAME_ARG=`egrep -e '^-s?name' "$EJABBERD_VMARGS_PATH"`
+if [ -z "$NODENAME_ARG" ]; then
+    echo "vm.args needs to have either -name or -sname parameter."
+    exit 1
+fi
+FORCE_FLAG1='"--force"'
+FORCE_FLAG2='"-f"'
+
+NAME_TYPE="${NODENAME_ARG% *}"
+NODENAME="${NODENAME_ARG#* }"
+
+join_cluster()
+{
+        WARNING="Warning. This will drop all current connections and will discard all persistent data from Mnesia.
+        Do you want to continue? (yes/no)"
+        DISPLAY="Joining the cluster..."
+        manage_cluster "$WARNING" "$DISPLAY"
+}
+
+leave_cluster()
+{
+        WARNING="Warning. This will drop all current connections and will discard all persistent data from Mnesia.
+        Do you want to continue? (yes/no)"
+        DISPLAY="Leaving the cluster..."
+
+        manage_cluster "$WARNING" "$DISPLAY"
+}
+
+remove_from_cluster()
+{
+        WARNING="Warning. If the node is alive this will drop all current connections on the remote node and will discard all persistent data from Mnesia.
+        Do you want to continue? (yes/no)"
+        DISPLAY="Removing node from the cluster..."
+        manage_cluster "$WARNING" "$DISPLAY"
+}
+
+manage_cluster()
+{
+        case $QUOTED_ARGS in
+            *$FORCE_FLAG1*|*$FORCE_FLAG2*)
+                QUOTED_ARGS=$(echo $QUOTED_ARGS|sed "s/$FORCE_FLAG1//")
+                QUOTED_ARGS=$(echo $QUOTED_ARGS|sed "s/$FORCE_FLAG2//")
+                ctl $QUOTED_ARGS;;
+             *)
+                GUARD="unknown"
+                until [ "$GUARD" = "yes" ] || [ "$GUARD" = "no" ] ; do
+                    echo $1
+                    read GUARD
+                    if [ "$GUARD" =  "yes" ]; then
+                        echo $2
+                        ctl $QUOTED_ARGS
+                    elif [ "$GUARD" = "no" ]; then
+                        echo "Operation discarded by user"
+                        exit 1
+                    else
+                        echo "Command unknown. Do you want to continue? (yes/no)"
+                    fi
+                done;;
+        esac
+}
+
+# The function is executed in a new process
+run_scripts ()
+({
+    set -e
+    # Run scripts with prefix "$1" in order
+    export ERTS_PATH="$ERTS_PATH"
+    export MIM_DIR="$MIM_DIR"
+    export PATH="$ERTS_PATH:$PATH"
+    for i in `ls $SCRIPTS_DIR/$1* | sort -V`; do
+        echo "Execute $i"
+        $i
+    done
+})
+
+bootstrap ()
+{
+    run_scripts bootstrap
+}
+
+print_install_dir ()
+{
+    echo "$MIM_DIR"
+}
+
+run_escript()
+{
+    export MIM_DIR="$MIM_DIR"
+
+    shift
+    "$ERTS_PATH"/escript $@
+}
+
+start ()
+{
+    "$RUNNER_SCRIPT_DIR"/mongooseim start
+}
+stop ()
+{
+    "$RUNNER_SCRIPT_DIR"/mongooseim stop
+}
+
+force_stop ()
+{
+    "$RUNNER_SCRIPT_DIR"/mongooseim force_stop
+}
+
+# attach to server
+debug ()
+{
+    "$RUNNER_SCRIPT_DIR"/mongooseim debug
+}
+
+# start interactive server
+live ()
+{
+    "$RUNNER_SCRIPT_DIR"/mongooseim console
+}
+
+# start non-interactive server still attached to terminal
+foreground ()
+{
+    "$RUNNER_SCRIPT_DIR"/mongooseim foreground
+}
+
+help ()
+{
+    echo ""
+    echo "Commands to start a MongooseIM node:"
+    echo "  start           Start a MongooseIM node as daemon (detached from terminal)"
+    echo "  debug           Attach an interactive Erlang shell to a running MongooseIM node"
+    echo "  live            Start MongooseIM node in live (interactive) mode"
+    echo "  foreground      Start MongooseIM node in foreground (non-interactive) mode"
+    echo "MongooseIM cluster management commands:"
+    echo "  join_cluster other_node_name                Add current node to cluster"
+    echo "  leave_cluster                               Make the current node leave the cluster"
+    echo "  remove_from_cluster other_node_name         Remove dead node from the cluster"
+    echo "Extra Commands:"
+    echo "  bootstrap           Executes MongooseIM init scripts (used for initial configuration)"
+    echo "  print_install_dir   Prints path to MongooseIM release directory"
+    echo "  escript             Runs escript command using embedded Erlang Runtime System"
+    echo ""
+}
+
+# common control function
+ctl ()
+{
+    COMMAND=$@
+
+    # Control number of connections identifiers
+    # using flock if available. Expects a linux-style
+    # flock that can lock a file descriptor.
+    MAXCONNID=100
+    CONNLOCKDIR="{{mongooseim_lock_dir}}/ctl"
+    mkdir -p "$CONNLOCKDIR"
+    FLOCK='/usr/bin/flock'
+    if [ ! -x "$FLOCK" ] || [ ! -d "$CONNLOCKDIR" ] ; then
+	JOT='/usr/bin/jot'
+	if [ ! -x "$JOT" ] ; then
+	    # no flock or jot, simply invoke ctlexec()
+	    CTL_CONN="ctl-${NODENAME}"
+	    ctlexec $CTL_CONN $COMMAND
+	    result=$?
+	else
+	    # no flock, but at least there is jot
+	    RAND=`jot -r 1 0 $MAXCONNID`
+	    CTL_CONN="ctl-${RAND}-${NODENAME}"
+	    ctlexec $CTL_CONN $COMMAND
+	    result=$?
+	fi
+    else
+	# we have flock so we get a lock
+	# on one of a limited number of
+	# conn names -- this allows
+	# concurrent invocations using a bound
+	# number of atoms
+	for N in $(seq 1 $MAXCONNID); do
+	    CTL_CONN="mongooseimctl-$N-${NODENAME}"
+	    CTL_LOCKFILE="$CONNLOCKDIR/$CTL_CONN"
+	    (
+		exec 8>"$CTL_LOCKFILE"
+		if flock --nb 8; then
+		    ctlexec $CTL_CONN $COMMAND
+                    ssresult=$?
+                    # segregate from possible flock exit(1)
+		    ssresult=$(expr $ssresult \* 10)
+		    exit $ssresult
+		else
+		    exit 1
+		fi
+            )
+	    result=$?
+	    if [ $result -eq 1 ]; then
+                # means we errored out in flock
+                # rather than in the exec - stay in the loop
+                # trying other conn names...
+		badlock=1
+	    else
+		badlock=""
+		break;
+	    fi
+	done
+	result=$(expr $result / 10)
+    fi
+
+    if [ "$badlock" ];then
+	echo "Ran out of connections to try. Your MongooseIM processes" >&2
+	echo "may be stuck or this is a very busy server. For very"   >&2
+	echo "busy servers, consider raising MAXCONNID in mongooseimctl">&2
+	exit 1;
+    fi
+
+    case $result in
+	0) :;;
+	1) :;;
+	2) help;;
+	3) help;;
+    esac
+    return $result
+}
+
+ctlexec ()
+{
+    CONN_NAME=$1; shift
+    COMMAND=$@
+    "$ERL" \
+      $NAME_TYPE ${CONN_NAME} \
+      -noinput \
+      -hidden \
+      $COOKIE_ARG \
+      -args_file "$RUNNER_ETC_DIR"/vm.dist.args \
+      -pa "$EJABBERD_EBIN_PATH" \
+      -s ejabberd_ctl -extra $NODENAME $COMMAND
+}
+
+# display ctl usage
+usage ()
+{
+    ctl
+    exit
+}
+
+# stop epmd if there is no other running node
+stop_epmd()
+{
+    "$EPMD" -names | grep -q name || "$EPMD" -kill
+}
+
+# allow sync calls
+wait_for_status()
+{
+    # args: status try delay
+    # return: 0 OK, 1 KO
+    timeout=$2
+    status=4
+    times=0
+    while [ $status -ne $1 ]; do
+        # Skip first sleep
+        if [ $times -ne 0 ]; then
+            sleep $3
+        fi
+        timeout=$(($timeout - 1))
+        [ $timeout -eq 0 ] && {
+            break
+        } || {
+            ctl status > /dev/null
+            status=$?
+        }
+        times=$(($times + 1))
+    done
+    [ $timeout -eq 0 ] && {
+        echo "wait_for_status: timeout"
+        status=1
+    } || {
+        status=0
+    }
+    return $status
+}
+
+# Calling wait_for_status creates erlang shell process many times, which is resource intensive.
+# Checking for EJABBERD_STATUS_PATH is more resource conservative.
+function wait_for_status_file
+{
+    if [ -z "$EJABBERD_STATUS_PATH" ]; then
+        return 0;
+    else
+        do_wait_for_status_file $@
+    fi
+}
+
+# Usage: read_file_or_default "FILENAME" "DEFAULT"
+function read_file_or_default
+{
+    # Ignore file not found error message
+    cat "$1" 2>/dev/null || echo "$2"
+}
+
+function do_wait_for_status_file
+{
+    # args: status try delay
+    # return: 0 OK, 1 KO
+    timeout=$2
+    status="unknown"
+    times=0
+    while [ "$status" != "$1" ]; do
+        # Skip first sleep
+        if [ $times -ne 0 ]; then
+            sleep $3
+        fi
+        timeout=$(($timeout - 1))
+        [ $timeout -eq 0 ] && {
+            break
+        } || {
+            status=$(read_file_or_default "$EJABBERD_STATUS_PATH" "file_missing")
+        }
+        times=$(($times + 1))
+    done
+    [ $timeout -eq 0 ] && {
+        echo "wait_for_status_file: timeout, last status: $status, expected status: $1"
+        echo "EJABBERD_STATUS_PATH=$EJABBERD_STATUS_PATH"
+        status=1
+    } || {
+        status=0
+    }
+    return $status
+}
+
+function is_started_status_file
+{
+    status=$(read_file_or_default "$EJABBERD_STATUS_PATH" "file_missing")
+    [ "$status" = "started" ]
+}
+
+# parse command line parameters
+ARGS=""; QUOTED_ARGS=""
+for PARAM in "$@"
+do
+    case $PARAM in
+        --)
+	    break ;;
+         *)
+	    ARGS="$ARGS$PARAM"; ARGS="$ARGS ";
+	    QUOTED_ARGS=$QUOTED_ARGS'"'$PARAM'"'; QUOTED_ARGS=$QUOTED_ARGS" " ;;
+    esac
+done
+
+case $1 in
+    'bootstrap') bootstrap;;
+    'start') start;;
+    'stop') stop;;
+    'force_stop') force_stop;;
+    'join_cluster') join_cluster;;
+    'leave_cluster') leave_cluster;;
+    'remove_from_cluster') remove_from_cluster;;
+    'debug') debug;;
+    'live') live;;
+    'foreground') foreground;;
+    'started') wait_for_status_file started 60 1 || true; wait_for_status 0 30 2;; # wait 30x2s before timeout
+    'stopped') is_started_status_file && wait_for_status_file stopped 30 1 || true; wait_for_status 3 15 2; stop_epmd;; # wait 15x2s before timeout
+    'print_install_dir') print_install_dir;;
+    'escript') run_escript $@;;
+    *) ctl $QUOTED_ARGS;;
+esac
